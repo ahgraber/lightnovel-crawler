@@ -18,7 +18,7 @@ from ..core.sources import crawler_list, prepare_crawler
 from ..models import Chapter, CombinedSearchResult, OutputFormat
 from .browser import Browser
 from .crawler import Crawler
-from .download_chapters import fetch_chapter_body
+from .download_chapters import fetch_chapter_body, load_chapter_body_from_cache
 from .download_images import fetch_chapter_images
 from .exeptions import ScraperErrorGroup
 from .metadata import save_metadata
@@ -311,26 +311,9 @@ class App:
     def use_chapter_body(self, chapter: Chapter):
         """Yield a chapter body loaded from cache and clear it afterwards."""
 
-        body: Optional[str]
-        if hasattr(chapter, "get"):
-            body = chapter.get("body")
-        else:
-            body = getattr(chapter, "body", None)
-
-        body_from_cache = body
         body_key_present = isinstance(chapter, dict) and "body" in chapter
-
-        if not body_from_cache:
-            cached = self.load_cached_chapter(chapter)
-            if cached:
-                cached_body = cached.get("body")
-                if cached_body:
-                    body_from_cache = cached_body
-                    if isinstance(chapter, Chapter):
-                        chapter.body = cached_body
-                    elif isinstance(chapter, dict):
-                        chapter["body"] = cached_body
-                        body_key_present = True
+        cache_file = self.get_chapter_cache_file(chapter)
+        body_from_cache = load_chapter_body_from_cache(chapter, cache_file)
 
         try:
             yield body_from_cache
