@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 from threading import Event
+from typing import Any, Optional
 from ..models.chapter import Chapter
 from .arguments import get_args
 
@@ -51,6 +52,75 @@ def _save_chapter(file_name: Path, chapter: Chapter) -> Path:
 
     chapter.body = None
     return file_name
+
+
+def _chapter_ref_for_log(chapter: Chapter) -> str:
+    chapter_id = getattr(chapter, "id", None)
+    chapter_title = getattr(chapter, "title", None)
+    if chapter_title and chapter_id is not None:
+        return f"{chapter_title} (id={chapter_id})"
+    if chapter_title:
+        return chapter_title
+    if chapter_id is not None:
+        return f"id={chapter_id}"
+    return "unknown chapter"
+
+
+def load_chapter_body_from_cache(
+    chapter: Chapter, cache_file: Optional[Path]
+) -> Optional[str]:
+    chapter_ref = _chapter_ref_for_log(chapter)
+    body = None
+    if hasattr(chapter, "get"):
+        body = chapter.get("body")
+    if not body:
+        body = getattr(chapter, "body", None)
+    if body:
+        chapter.body = body
+        return body
+
+    if not cache_file:
+        return None
+
+    try:
+        with cache_file.open("r", encoding="utf-8") as file:
+            cached_data: Any = json.load(file)
+    except FileNotFoundError:
+        logger.warning(
+            "Chapter cache missing for %s at %s", chapter_ref, cache_file
+        )
+        return None
+    except json.JSONDecodeError:
+        logger.warning(
+            "Invalid chapter cache for %s at %s", chapter_ref, cache_file
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "Failed to read chapter cache for %s at %s: %s",
+            chapter_ref,
+            cache_file,
+            exc,
+        )
+        return None
+
+    if not isinstance(cached_data, dict):
+        logger.warning(
+            "Chapter cache for %s at %s did not contain a JSON object",
+            chapter_ref,
+            cache_file,
+        )
+        return None
+
+    body = cached_data.get("body")
+    if body:
+        chapter.body = body
+
+    cached_images = cached_data.get("images")
+    if cached_images and hasattr(chapter, "get") and not chapter.get("images"):
+        chapter["images"] = cached_images
+
+    return body
 
 
 def restore_chapter_body(app):
