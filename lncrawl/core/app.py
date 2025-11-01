@@ -1,8 +1,9 @@
 import atexit
+import json
 import logging
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -39,7 +40,7 @@ class App:
         self.search_results: List[CombinedSearchResult] = []
         self.output_path = C.DEFAULT_OUTPUT_PATH
         self.pack_by_volume = False
-        self.chapters: List[Chapter] = []
+        self._chapters: List[Chapter] = []
         self.book_cover: Optional[str] = None
         self.output_formats: Dict[OutputFormat, bool] = {}
         self.generated_books: Dict[OutputFormat, List[str]] = {}
@@ -52,7 +53,18 @@ class App:
         self.fetch_chapter_progress: float = 0
         self.fetch_images_progress: float = 0
         self.binding_progress: float = 0
+        self._chapter_cache_lock = Lock()
+        self.chapter_cache_files: Dict[int, Path] = {}
         atexit.register(self.destroy)
+
+    @property
+    def chapters(self) -> List[Chapter]:
+        return self._chapters
+
+    @chapters.setter
+    def chapters(self, value: List[Chapter]):
+        self._chapters = value
+        self.rebuild_chapter_cache_registry()
 
     @property
     def progress(self):
@@ -214,8 +226,108 @@ class App:
             Path(C.DEFAULT_OUTPUT_PATH) / source_name / self.good_file_name
         )
         os.makedirs(self.output_path, exist_ok=True)
+        self.rebuild_chapter_cache_registry()
 
     # ----------------------------------------------------------------------- #
+
+    def rebuild_chapter_cache_registry(self):
+        with self._chapter_cache_lock:
+            valid_ids = {chapter.id for chapter in self._chapters}
+            self.chapter_cache_files = {
+                chapter_id: path
+                for chapter_id, path in self.chapter_cache_files.items()
+                if chapter_id in valid_ids
+            }
+
+        if not self._chapters or not self.output_path:
+            return
+
+        for chapter in self._chapters:
+            self.register_chapter_cache_file(chapter)
+
+    def _build_chapter_cache_path(self, chapter: Chapter) -> Path:
+        from .download_chapters import get_chapter_file
+
+        return get_chapter_file(
+            chapter,
+            output_path=self.output_path,
+            pack_by_volume=self.pack_by_volume,
+        )
+
+    def register_chapter_cache_file(
+        self,
+        chapter: Chapter,
+        file_path: Optional[Path] = None,
+    ) -> Path:
+        if file_path is None:
+            if not self.output_path:
+                raise LNException("Output path is not defined")
+            file_path = self._build_chapter_cache_path(chapter)
+
+        with self._chapter_cache_lock:
+            self.chapter_cache_files[chapter.id] = file_path
+
+        return file_path
+
+    def get_chapter_cache_file(self, chapter: Chapter | int) -> Optional[Path]:
+        chapter_id = chapter if isinstance(chapter, int) else chapter.id
+        with self._chapter_cache_lock:
+            file_path = self.chapter_cache_files.get(chapter_id)
+
+        if file_path is not None:
+            return file_path
+
+        chapter_obj: Optional[Chapter]
+        if isinstance(chapter, Chapter):
+            chapter_obj = chapter
+        else:
+            chapter_obj = next(
+                (item for item in self._chapters if item.id == chapter_id),
+                None,
+            )
+
+        if not chapter_obj or not self.output_path:
+            return None
+
+        return self.register_chapter_cache_file(chapter_obj)
+
+    def load_cached_chapter(self, chapter: Chapter | int) -> Optional[Dict]:
+        file_path = self.get_chapter_cache_file(chapter)
+        if not file_path or not file_path.is_file():
+            return None
+
+        try:
+            with file_path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except (json.JSONDecodeError, OSError):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.exception(
+                    "Failed to read cached chapter file: %s", file_path
+                )
+            return None
+
+    def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
+        if chapter.body:
+            return chapter
+
+        cached = self.load_cached_chapter(chapter)
+        if not cached:
+            return chapter
+
+        enriched = chapter.copy()
+        if cached.get("body") is not None:
+            enriched.body = cached.get("body")
+        if cached.get("images") is not None:
+            enriched.images = cached.get("images")
+        if "success" in cached:
+            enriched.success = cached.get("success", enriched.success)
+
+        for key, value in cached.items():
+            if key in {"body", "images", "success"}:
+                continue
+            enriched[key] = value
+
+        return enriched
 
     def start_download(self, signal=Event()):
         """Requires: crawler, chapters, output_path"""
@@ -252,6 +364,10 @@ class App:
         logger.info("Processing data for binding")
         assert self.crawler
 
+        prepared_chapters = [
+            self.ensure_chapter_body(chapter) for chapter in self.chapters
+        ]
+
         data = {}
         if self.pack_by_volume:
             for vol in self.crawler.volumes:
@@ -261,14 +377,17 @@ class App:
                     vol["final_chapter"],
                 )
                 data[filename_suffix] = [
-                    x
-                    for x in self.chapters
-                    if x["volume"] == vol["id"] and len(x["body"]) > 0
+                    chapter
+                    for chapter in prepared_chapters
+                    if chapter["volume"] == vol["id"]
+                    and chapter.get("body")
                 ]
         else:
             first_id = self.chapters[0]["id"]
             last_id = self.chapters[-1]["id"]
-            data[f"c{first_id}-{last_id}"] = self.chapters
+            data[f"c{first_id}-{last_id}"] = [
+                chapter for chapter in prepared_chapters if chapter.get("body")
+            ]
 
         for fmt in generate_books(self, data):
             save_metadata(self)
