@@ -335,10 +335,13 @@ class App:
         try:
             yield body_from_cache
         finally:
-            if body_from_cache is not None:
-                if isinstance(chapter, Chapter):
+            if isinstance(chapter, Chapter):
+                if body_from_cache is not None:
                     chapter.body = None
-                elif isinstance(chapter, dict) and (body_key_present or "body" in chapter):
+            elif isinstance(chapter, dict):
+                if not body_key_present:
+                    chapter.pop("body", None)
+                elif body_from_cache is not None:
                     chapter["body"] = None
 
     def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
