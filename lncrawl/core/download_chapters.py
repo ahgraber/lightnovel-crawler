@@ -6,8 +6,6 @@ import json
 import logging
 from pathlib import Path
 from threading import Event
-from typing import Dict
-
 from ..models.chapter import Chapter
 from .arguments import get_args
 
@@ -29,7 +27,7 @@ def get_chapter_file(
     return json_file
 
 
-def _save_chapter(file_name: Path, chapter: Chapter):
+def _save_chapter(file_name: Path, chapter: Chapter) -> Path:
     if not chapter.body:
         chapter.body = "<p><i>Failed to download chapter body</i></p>"
 
@@ -51,36 +49,45 @@ def _save_chapter(file_name: Path, chapter: Chapter):
     with file_name.open("w", encoding="utf-8") as fp:
         json.dump(chapter, fp, ensure_ascii=False)
 
+    chapter.body = None
+    return file_name
+
 
 def restore_chapter_body(app):
     from .app import App
     assert isinstance(app, App) and app.crawler, 'Invalid app instance'
 
-    # attempt to restore from file cache
+    app.rebuild_chapter_cache_registry()
+
     restored = 0
-    file_names: Dict[int, Path] = {}
     for chapter in app.chapters:
-        file_name = get_chapter_file(
-            chapter,
-            pack_by_volume=app.pack_by_volume,
-            output_path=app.output_path,
-        )
-        file_names[chapter.id] = file_name
+        file_name = app.get_chapter_cache_file(chapter)
+        if not file_name:
+            continue
 
         if not file_name.is_file():
             continue
+
         try:
-            with open(file_name, "r", encoding="utf-8") as file:
-                old_chapter = json.load(file)
-                chapter.update(**old_chapter)
-                restored += 1
+            with file_name.open("r", encoding="utf-8") as file:
+                cached_chapter = json.load(file)
         except json.JSONDecodeError:
-            logger.debug("Unable to decode JSON from the file: %s" % file_name)
-        except Exception as e:
-            logger.exception("An error occurred while reading the file:", e)
+            logger.debug("Unable to decode JSON from the file: %s", file_name)
+            continue
+        except Exception:  # pragma: no cover - unexpected failure
+            logger.exception(
+                "An error occurred while reading the file: %s", file_name
+            )
+            continue
+
+        chapter.update(**cached_chapter)
+        app.register_chapter_cache_file(chapter, file_name)
+
+        if chapter.success:
+            restored += 1
+            chapter.body = None
 
     logger.info(f"Restored {restored}/{len(app.chapters)} chapters")
-    return file_names
 
 
 def fetch_chapter_body(app, signal=Event()):
@@ -91,7 +98,7 @@ def fetch_chapter_body(app, signal=Event()):
         return
 
     # attempt to restore from file cache
-    file_names = restore_chapter_body(app)
+    restore_chapter_body(app)
 
     # remaining chapters
     pending_chapters = [
@@ -104,9 +111,11 @@ def fetch_chapter_body(app, signal=Event()):
     app.fetch_chapter_progress = 100 * current / len(app.chapters)
     for chapter in app.crawler.download_chapters(pending_chapters, signal=signal):
         if chapter:
-            file_path = file_names.get(chapter.id)
-            if file_path:
-                _save_chapter(file_path, chapter)
+            file_path = app.get_chapter_cache_file(chapter)
+            if file_path is None:
+                file_path = app.register_chapter_cache_file(chapter)
+            saved_path = _save_chapter(file_path, chapter)
+            app.register_chapter_cache_file(chapter, saved_path)
         current += 1
         app.fetch_chapter_progress = 100 * current / len(app.chapters)
         yield
