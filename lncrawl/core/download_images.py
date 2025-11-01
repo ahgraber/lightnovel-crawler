@@ -9,7 +9,7 @@ from threading import Event
 from typing import List
 
 from ..utils.imgen import generate_cover_image
-from .download_chapters import _save_chapter
+from .download_chapters import _save_chapter, load_chapter_body_from_cache
 
 logger = logging.getLogger(__name__)
 
@@ -86,24 +86,6 @@ def fetch_chapter_images(app, signal=Event()):
     finally:
         logger.info(f"Downloaded {current} images")
 
-    def _load_cached_body(chapter):
-        body = chapter.get("body")
-        if body:
-            return body
-
-        cached = app.load_cached_chapter(chapter)
-        if not cached:
-            return None
-
-        cached_images = cached.get("images")
-        if cached_images and not chapter.get("images"):
-            chapter["images"] = cached_images
-
-        body = cached.get("body")
-        if body:
-            chapter["body"] = body
-        return body
-
     # discard failed images
     for chapter in app.chapters:
         images = chapter.get("images")
@@ -118,21 +100,23 @@ def fetch_chapter_images(app, signal=Event()):
         if not failed_images:
             continue
 
-        body = _load_cached_body(chapter)
+        cache_file = app.get_chapter_cache_file(chapter)
+        body = load_chapter_body_from_cache(chapter, cache_file)
         if not body:
             continue
+        try:
+            soup = app.crawler.make_soup(body)
+            if not soup.body:
+                continue
 
-        soup = app.crawler.make_soup(body)
-        if not soup.body:
-            continue
+            for filename in failed_images:
+                images.pop(filename)
+                for img in soup.select(f'img[alt="{filename}"]'):
+                    img.extract()
+            chapter["body"] = soup.body.decode_contents()
 
-        for filename in failed_images:
-            images.pop(filename)
-            for img in soup.select(f'img[alt="{filename}"]'):
-                img.extract()
-        chapter["body"] = soup.body.decode_contents()
-
-        cache_file = app.get_chapter_cache_file(chapter)
-        if cache_file is None:
-            cache_file = app.register_chapter_cache_file(chapter)
-        _save_chapter(cache_file, chapter)
+            if cache_file is None:
+                cache_file = app.register_chapter_cache_file(chapter)
+            _save_chapter(cache_file, chapter)
+        finally:
+            chapter.body = None
