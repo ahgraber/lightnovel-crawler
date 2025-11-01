@@ -158,19 +158,26 @@ def bind_epub_book(
 
         volume_contents = []
         for chapter in chapters:
-            chapter_item = epub.EpubHtml(  # type:ignore
-                file_name=f"chapter_{chapter.id}.xhtml",
-                content=str(chapter["body"]),
-                title=chapter["title"],
-            )
-            chapter_item.add_link(
-                href=style_item.file_name,
-                rel="stylesheet",
-                type="text/css",
-            )
-            book.add_item(chapter_item)
-            spine.append(chapter_item)
-            volume_contents.append(chapter_item)
+            with app.use_chapter_body(chapter) as body:
+                if not body:
+                    logger.warning(
+                        "Skipping chapter %s due to missing body", chapter.get("title")
+                    )
+                    continue
+
+                chapter_item = epub.EpubHtml(  # type:ignore
+                    file_name=f"chapter_{chapter.id}.xhtml",
+                    content=str(body),
+                    title=chapter["title"],
+                )
+                chapter_item.add_link(
+                    href=style_item.file_name,
+                    rel="stylesheet",
+                    type="text/css",
+                )
+                book.add_item(chapter_item)
+                spine.append(chapter_item)
+                volume_contents.append(chapter_item)
 
         volume_section = epub.Section(  # type:ignore
             volume_title,
