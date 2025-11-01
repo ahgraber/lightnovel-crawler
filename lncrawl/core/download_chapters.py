@@ -56,14 +56,12 @@ def _save_chapter(file_name: Path, chapter: Chapter) -> Path:
 
 
 def _chapter_ref_for_log(chapter: Chapter) -> str:
-    chapter_id = getattr(chapter, "id", None)
-    chapter_title = getattr(chapter, "title", None)
-    if chapter_title and chapter_id is not None:
-        return f"{chapter_title} (id={chapter_id})"
-    if chapter_title:
-        return chapter_title
-    if chapter_id is not None:
-        return f"id={chapter_id}"
+    if chapter.title and chapter.id is not None:
+        return f"{chapter.title} (id={chapter.id})"
+    if chapter.title:
+        return chapter.title
+    if chapter.id is not None:
+        return f"id={chapter.id}"
     return "unknown chapter"
 
 
@@ -71,12 +69,8 @@ def load_chapter_body_from_cache(
     chapter: Chapter, cache_file: Optional[Path]
 ) -> Optional[str]:
     chapter_ref = _chapter_ref_for_log(chapter)
-    body = chapter.get("body")
-    if not body:
-        body = getattr(chapter, "body", None)
-    if body:
-        chapter.body = body
-        return body
+    if chapter.body:
+        return chapter.body
 
     if not cache_file:
         return None
@@ -116,7 +110,7 @@ def load_chapter_body_from_cache(
         chapter.body = body
 
     cached_images = cached_data.get("images")
-    if cached_images and not chapter.get("images"):
+    if cached_images and not chapter.images:
         chapter.images = cached_images
 
     return body
