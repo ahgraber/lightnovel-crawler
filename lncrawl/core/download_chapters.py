@@ -66,6 +66,23 @@ def _chapter_ref_for_log(chapter: Chapter) -> str:
     return "unknown chapter"
 
 
+def _set_chapter_body(chapter: Any, value: Optional[str]) -> None:
+    """Assign the provided body value to a chapter-like object."""
+
+    if hasattr(chapter, "__setitem__"):
+        try:
+            chapter["body"] = value
+        except (TypeError, KeyError):
+            # Fallback to attribute assignment only if mapping assignment fails.
+            pass
+
+    try:
+        chapter.body = value
+    except AttributeError:
+        # Some dict-like objects (e.g. plain ``dict``) do not support attribute assignment.
+        pass
+
+
 def load_chapter_body_from_cache(
     chapter: Chapter, cache_file: Optional[Path]
 ) -> Optional[str]:
@@ -76,7 +93,7 @@ def load_chapter_body_from_cache(
     if not body:
         body = getattr(chapter, "body", None)
     if body:
-        chapter.body = body
+        _set_chapter_body(chapter, body)
         return body
 
     if not cache_file:
@@ -114,7 +131,7 @@ def load_chapter_body_from_cache(
 
     body = cached_data.get("body")
     if body:
-        chapter.body = body
+        _set_chapter_body(chapter, body)
 
     cached_images = cached_data.get("images")
     if cached_images and hasattr(chapter, "get") and not chapter.get("images"):
