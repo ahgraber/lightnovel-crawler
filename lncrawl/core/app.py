@@ -311,21 +311,14 @@ class App:
     def use_chapter_body(self, chapter: Chapter):
         """Yield a chapter body loaded from cache and clear it afterwards."""
 
-        body_key_present = isinstance(chapter, dict) and "body" in chapter
         cache_file = self.get_chapter_cache_file(chapter)
         body_from_cache = load_chapter_body_from_cache(chapter, cache_file)
 
         try:
             yield body_from_cache
         finally:
-            if isinstance(chapter, Chapter):
-                if body_from_cache is not None:
-                    chapter.body = None
-            elif isinstance(chapter, dict):
-                if not body_key_present:
-                    chapter.pop("body", None)
-                elif body_from_cache is not None:
-                    chapter["body"] = None
+            if body_from_cache is not None:
+                chapter.body = None
 
     def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
         if chapter.body:
