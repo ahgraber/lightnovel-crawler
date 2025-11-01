@@ -2,6 +2,7 @@ import atexit
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock
 from typing import Dict, List, Optional, Tuple
@@ -306,6 +307,40 @@ class App:
                 )
             return None
 
+    @contextmanager
+    def use_chapter_body(self, chapter: Chapter):
+        """Yield a chapter body loaded from cache and clear it afterwards."""
+
+        body: Optional[str]
+        if hasattr(chapter, "get"):
+            body = chapter.get("body")
+        else:
+            body = getattr(chapter, "body", None)
+
+        body_from_cache = body
+        body_key_present = isinstance(chapter, dict) and "body" in chapter
+
+        if not body_from_cache:
+            cached = self.load_cached_chapter(chapter)
+            if cached:
+                cached_body = cached.get("body")
+                if cached_body:
+                    body_from_cache = cached_body
+                    if isinstance(chapter, Chapter):
+                        chapter.body = cached_body
+                    elif isinstance(chapter, dict):
+                        chapter["body"] = cached_body
+                        body_key_present = True
+
+        try:
+            yield body_from_cache
+        finally:
+            if body_from_cache is not None:
+                if isinstance(chapter, Chapter):
+                    chapter.body = None
+                elif isinstance(chapter, dict) and (body_key_present or "body" in chapter):
+                    chapter["body"] = None
+
     def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
         if chapter.body:
             return chapter
@@ -364,10 +399,14 @@ class App:
         logger.info("Processing data for binding")
         assert self.crawler
 
-        prepared_chapters = [
-            self.ensure_chapter_body(chapter) for chapter in self.chapters
-        ]
+        metadata_chapters = []
+        for chapter in self.chapters:
+            chapter_meta = chapter.copy()
+            chapter_meta.body = None
+            metadata_chapters.append(chapter_meta)
 
+        # Binder helpers are responsible for fetching bodies when required via
+        # ``App.use_chapter_body`` to avoid loading every chapter simultaneously.
         data = {}
         if self.pack_by_volume:
             for vol in self.crawler.volumes:
@@ -378,16 +417,13 @@ class App:
                 )
                 data[filename_suffix] = [
                     chapter
-                    for chapter in prepared_chapters
+                    for chapter in metadata_chapters
                     if chapter["volume"] == vol["id"]
-                    and chapter.get("body")
                 ]
         else:
             first_id = self.chapters[0]["id"]
             last_id = self.chapters[-1]["id"]
-            data[f"c{first_id}-{last_id}"] = [
-                chapter for chapter in prepared_chapters if chapter.get("body")
-            ]
+            data[f"c{first_id}-{last_id}"] = list(metadata_chapters)
 
         for fmt in generate_books(self, data):
             save_metadata(self)
