@@ -2,6 +2,7 @@ import atexit
 import json
 import logging
 import os
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock
@@ -42,6 +43,7 @@ class App:
         self.output_path = C.DEFAULT_OUTPUT_PATH
         self.pack_by_volume = False
         self._chapters: List[Chapter] = []
+        self._chapter_lookup: Dict[int, Chapter] = {}
         self.book_cover: Optional[str] = None
         self.output_formats: Dict[OutputFormat, bool] = {}
         self.generated_books: Dict[OutputFormat, List[str]] = {}
@@ -56,6 +58,8 @@ class App:
         self.binding_progress: float = 0
         self._chapter_cache_lock = Lock()
         self.chapter_cache_files: Dict[int, Path] = {}
+        self._chapter_body_cache: OrderedDict[int, str] = OrderedDict()
+        self._max_cached_bodies = 3
         atexit.register(self.destroy)
 
     @property
@@ -65,6 +69,7 @@ class App:
     @chapters.setter
     def chapters(self, value: List[Chapter]):
         self._chapters = value
+        self._chapter_lookup = {chapter.id: chapter for chapter in value}
         self.rebuild_chapter_cache_registry()
 
     @property
@@ -106,6 +111,9 @@ class App:
         self.generated_books = {}
         self.generated_archives = {}
         self.archived_outputs = None
+        self._chapter_lookup = {}
+        with self._chapter_cache_lock:
+            self._chapter_body_cache.clear()
         logger.debug("DONE")
 
     def __enter__(self):
@@ -239,6 +247,13 @@ class App:
                 for chapter_id, path in self.chapter_cache_files.items()
                 if chapter_id in valid_ids
             }
+            self._chapter_body_cache = OrderedDict(
+                (
+                    (chapter_id, body)
+                    for chapter_id, body in self._chapter_body_cache.items()
+                    if chapter_id in valid_ids
+                )
+            )
 
         if not self._chapters or not self.output_path:
             return
@@ -269,6 +284,21 @@ class App:
             self.chapter_cache_files[chapter.id] = file_path
 
         return file_path
+
+    def _cache_chapter_body(self, chapter_id: int, body: Optional[str]) -> None:
+        with self._chapter_cache_lock:
+            if not body:
+                self._chapter_body_cache.pop(chapter_id, None)
+                return
+
+            self._chapter_body_cache[chapter_id] = body
+            self._chapter_body_cache.move_to_end(chapter_id)
+
+            while len(self._chapter_body_cache) > self._max_cached_bodies:
+                evicted_id, _ = self._chapter_body_cache.popitem(last=False)
+                evicted = self._chapter_lookup.get(evicted_id)
+                if evicted:
+                    evicted.body = None
 
     def get_chapter_cache_file(self, chapter: Chapter | int) -> Optional[Path]:
         chapter_id = chapter if isinstance(chapter, int) else chapter.id
@@ -311,14 +341,33 @@ class App:
     def use_chapter_body(self, chapter: Chapter):
         """Yield a chapter body loaded from cache and clear it afterwards."""
 
-        cache_file = self.get_chapter_cache_file(chapter)
-        body_from_cache = load_chapter_body_from_cache(chapter, cache_file)
+        chapter_id = chapter.id
+
+        with self._chapter_cache_lock:
+            cached_body = self._chapter_body_cache.get(chapter_id)
+            if cached_body is not None:
+                self._chapter_body_cache.move_to_end(chapter_id)
+
+        body_from_cache: Optional[str] = cached_body
+        if body_from_cache is None:
+            cache_file = self.get_chapter_cache_file(chapter)
+            body_from_cache = load_chapter_body_from_cache(chapter, cache_file)
+            if body_from_cache:
+                self._cache_chapter_body(chapter_id, body_from_cache)
 
         try:
             yield body_from_cache
         finally:
-            if body_from_cache is not None:
-                chapter.body = None
+            updated_body = chapter.body
+            if updated_body and updated_body is not body_from_cache:
+                body_from_cache = updated_body
+
+            if body_from_cache:
+                self._cache_chapter_body(chapter_id, body_from_cache)
+            else:
+                self._cache_chapter_body(chapter_id, None)
+
+            chapter.body = None
 
     def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
         if chapter.body:
@@ -378,11 +427,9 @@ class App:
         logger.info("Processing data for binding")
         assert self.crawler
 
-        metadata_chapters = []
         for chapter in self.chapters:
-            chapter_meta = chapter.copy()
-            chapter_meta.body = None
-            metadata_chapters.append(chapter_meta)
+            if chapter.body:
+                chapter.body = None
 
         # Binder helpers are responsible for fetching bodies when required via
         # ``App.use_chapter_body`` to avoid loading every chapter simultaneously.
@@ -396,13 +443,13 @@ class App:
                 )
                 data[filename_suffix] = [
                     chapter
-                    for chapter in metadata_chapters
+                    for chapter in self.chapters
                     if chapter["volume"] == vol["id"]
                 ]
         else:
             first_id = self.chapters[0]["id"]
             last_id = self.chapters[-1]["id"]
-            data[f"c{first_id}-{last_id}"] = list(metadata_chapters)
+            data[f"c{first_id}-{last_id}"] = list(self.chapters)
 
         for fmt in generate_books(self, data):
             save_metadata(self)
