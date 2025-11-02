@@ -3,7 +3,7 @@ import logging
 import os
 from abc import ABC
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from threading import Event, Semaphore, Thread
+from threading import Event, Lock, Semaphore, Thread
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
 from tqdm import tqdm
@@ -55,6 +55,9 @@ class TaskManager(ABC):
             self._executor.shutdown(wait)
         if hasattr(self, "_limiter"):
             self._limiter.shutdown()
+        if hasattr(self, "_futures_lock"):
+            with self._futures_lock:
+                self._futures.clear()
 
     def init_executor(
         self,
@@ -70,8 +73,9 @@ class TaskManager(ABC):
         - workers (int, optional): Number of concurrent workers to expect. Default: 5.
         - ratelimit (float, optional): Number of requests per second.
         """
-        self._futures: List[Future] = []
         self.close()  # cleanup previous initialization
+        self._futures: List[Future] = []
+        self._futures_lock = Lock()
 
         if ratelimit and ratelimit > 0:
             workers = 1  # use single worker if ratelimit is being applied
@@ -101,8 +105,21 @@ class TaskManager(ABC):
         if not self._submit:
             raise Exception("No executor is available")
         future = self._submit(fn, *args, **kwargs)
-        self._futures.append(future)
+        with self._futures_lock:
+            self._futures.append(future)
+
+        future.add_done_callback(self._cleanup_future)
         return future
+
+    def _cleanup_future(self, future: Future) -> None:
+        lock = getattr(self, "_futures_lock", None)
+        if lock is None:
+            return
+        with lock:
+            try:
+                self._futures.remove(future)
+            except ValueError:
+                pass
 
     @staticmethod
     def progress_bar(

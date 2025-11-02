@@ -14,7 +14,7 @@ def get_filename(chapter):
     return str(chapter["id"]).rjust(5, "0") + ".html"
 
 
-def bind_html_chapter(chapters, index, direction="ltr"):
+def bind_html_chapter(app, chapters, index, direction="ltr"):
     chapter = chapters[index]
     prev_chapter = chapters[index - 1] if index > 0 else None
     next_chapter = chapters[index + 1] if index + 1 < len(chapters) else None
@@ -40,9 +40,10 @@ def bind_html_chapter(chapters, index, direction="ltr"):
     </div>
     """
 
-    main_body = chapter["body"]
-    if not main_body:
-        main_body = f"<h1>{chapter['title']}</h1><p>No contents</p>"
+    with app.use_chapter_body(chapter) as body:
+        main_body = body
+        if not main_body:
+            main_body = f"<h1>{chapter['title']}</h1><p>No contents</p>"
 
     html = f"""
     <!DOCTYPE html>
@@ -90,7 +91,7 @@ def make_webs(app, data) -> Generator[str, None, None]:
 
             # Generate HTML file
             direction = "rtl" if app.crawler.is_rtl else "ltr"
-            html, file_name = bind_html_chapter(chapters, index, direction)
+            html, file_name = bind_html_chapter(app, chapters, index, direction)
             file_name = os.path.join(dir_name, file_name)
             with open(file_name, "w", encoding="utf8") as file:
                 file.write(html)

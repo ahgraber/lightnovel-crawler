@@ -9,6 +9,7 @@ from threading import Event
 from typing import List
 
 from ..utils.imgen import generate_cover_image
+from .download_chapters import _save_chapter, load_chapter_body_from_cache
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +100,23 @@ def fetch_chapter_images(app, signal=Event()):
         if not failed_images:
             continue
 
-        soup = app.crawler.make_soup(chapter["body"])
-        if not soup.body:
+        cache_file = app.get_chapter_cache_file(chapter)
+        body = load_chapter_body_from_cache(chapter, cache_file)
+        if not body:
             continue
+        try:
+            soup = app.crawler.make_soup(body)
+            if not soup.body:
+                continue
 
-        for filename in failed_images:
-            images.pop(filename)
-            for img in soup.select(f'img[alt="{filename}"]'):
-                img.extract()
-        chapter["body"] = soup.body.decode_contents()
+            for filename in failed_images:
+                images.pop(filename)
+                for img in soup.select(f'img[alt="{filename}"]'):
+                    img.extract()
+            chapter["body"] = soup.body.decode_contents()
+
+            if cache_file is None:
+                cache_file = app.register_chapter_cache_file(chapter)
+            _save_chapter(cache_file, chapter)
+        finally:
+            chapter.body = None

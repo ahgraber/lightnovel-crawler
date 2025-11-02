@@ -1,8 +1,11 @@
 import atexit
+import json
 import logging
 import os
+from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -16,7 +19,7 @@ from ..core.sources import crawler_list, prepare_crawler
 from ..models import Chapter, CombinedSearchResult, OutputFormat
 from .browser import Browser
 from .crawler import Crawler
-from .download_chapters import fetch_chapter_body
+from .download_chapters import fetch_chapter_body, load_chapter_body_from_cache
 from .download_images import fetch_chapter_images
 from .exeptions import ScraperErrorGroup
 from .metadata import save_metadata
@@ -39,7 +42,8 @@ class App:
         self.search_results: List[CombinedSearchResult] = []
         self.output_path = C.DEFAULT_OUTPUT_PATH
         self.pack_by_volume = False
-        self.chapters: List[Chapter] = []
+        self._chapters: List[Chapter] = []
+        self._chapter_lookup: Dict[int, Chapter] = {}
         self.book_cover: Optional[str] = None
         self.output_formats: Dict[OutputFormat, bool] = {}
         self.generated_books: Dict[OutputFormat, List[str]] = {}
@@ -52,7 +56,21 @@ class App:
         self.fetch_chapter_progress: float = 0
         self.fetch_images_progress: float = 0
         self.binding_progress: float = 0
+        self._chapter_cache_lock = Lock()
+        self.chapter_cache_files: Dict[int, Path] = {}
+        self._chapter_body_cache: OrderedDict[int, str] = OrderedDict()
+        self._max_cached_bodies = 3
         atexit.register(self.destroy)
+
+    @property
+    def chapters(self) -> List[Chapter]:
+        return self._chapters
+
+    @chapters.setter
+    def chapters(self, value: List[Chapter]):
+        self._chapters = value
+        self._chapter_lookup = {chapter.id: chapter for chapter in value}
+        self.rebuild_chapter_cache_registry()
 
     @property
     def progress(self):
@@ -93,6 +111,9 @@ class App:
         self.generated_books = {}
         self.generated_archives = {}
         self.archived_outputs = None
+        self._chapter_lookup = {}
+        with self._chapter_cache_lock:
+            self._chapter_body_cache.clear()
         logger.debug("DONE")
 
     def __enter__(self):
@@ -214,8 +235,162 @@ class App:
             Path(C.DEFAULT_OUTPUT_PATH) / source_name / self.good_file_name
         )
         os.makedirs(self.output_path, exist_ok=True)
+        self.rebuild_chapter_cache_registry()
 
     # ----------------------------------------------------------------------- #
+
+    def rebuild_chapter_cache_registry(self):
+        with self._chapter_cache_lock:
+            valid_ids = {chapter.id for chapter in self._chapters}
+            self.chapter_cache_files = {
+                chapter_id: path
+                for chapter_id, path in self.chapter_cache_files.items()
+                if chapter_id in valid_ids
+            }
+            self._chapter_body_cache = OrderedDict(
+                (
+                    (chapter_id, body)
+                    for chapter_id, body in self._chapter_body_cache.items()
+                    if chapter_id in valid_ids
+                )
+            )
+
+        if not self._chapters or not self.output_path:
+            return
+
+        for chapter in self._chapters:
+            self.register_chapter_cache_file(chapter)
+
+    def _build_chapter_cache_path(self, chapter: Chapter) -> Path:
+        from .download_chapters import get_chapter_file
+
+        return get_chapter_file(
+            chapter,
+            output_path=self.output_path,
+            pack_by_volume=self.pack_by_volume,
+        )
+
+    def register_chapter_cache_file(
+        self,
+        chapter: Chapter,
+        file_path: Optional[Path] = None,
+    ) -> Path:
+        if file_path is None:
+            if not self.output_path:
+                raise LNException("Output path is not defined")
+            file_path = self._build_chapter_cache_path(chapter)
+
+        with self._chapter_cache_lock:
+            self.chapter_cache_files[chapter.id] = file_path
+
+        return file_path
+
+    def _cache_chapter_body(self, chapter_id: int, body: Optional[str]) -> None:
+        with self._chapter_cache_lock:
+            if not body:
+                self._chapter_body_cache.pop(chapter_id, None)
+                return
+
+            self._chapter_body_cache[chapter_id] = body
+            self._chapter_body_cache.move_to_end(chapter_id)
+
+            while len(self._chapter_body_cache) > self._max_cached_bodies:
+                evicted_id, _ = self._chapter_body_cache.popitem(last=False)
+                evicted = self._chapter_lookup.get(evicted_id)
+                if evicted:
+                    evicted.body = None
+
+    def get_chapter_cache_file(self, chapter: Chapter | int) -> Optional[Path]:
+        chapter_id = chapter if isinstance(chapter, int) else chapter.id
+        with self._chapter_cache_lock:
+            file_path = self.chapter_cache_files.get(chapter_id)
+
+        if file_path is not None:
+            return file_path
+
+        chapter_obj: Optional[Chapter]
+        if isinstance(chapter, Chapter):
+            chapter_obj = chapter
+        else:
+            chapter_obj = next(
+                (item for item in self._chapters if item.id == chapter_id),
+                None,
+            )
+
+        if not chapter_obj or not self.output_path:
+            return None
+
+        return self.register_chapter_cache_file(chapter_obj)
+
+    def load_cached_chapter(self, chapter: Chapter | int) -> Optional[Dict]:
+        file_path = self.get_chapter_cache_file(chapter)
+        if not file_path or not file_path.is_file():
+            return None
+
+        try:
+            with file_path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except (json.JSONDecodeError, OSError):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.exception(
+                    "Failed to read cached chapter file: %s", file_path
+                )
+            return None
+
+    @contextmanager
+    def use_chapter_body(self, chapter: Chapter):
+        """Yield a chapter body loaded from cache and clear it afterwards."""
+
+        chapter_id = chapter.id
+
+        with self._chapter_cache_lock:
+            cached_body = self._chapter_body_cache.get(chapter_id)
+            if cached_body is not None:
+                self._chapter_body_cache.move_to_end(chapter_id)
+
+        body_from_cache: Optional[str] = cached_body
+        if body_from_cache is None:
+            cache_file = self.get_chapter_cache_file(chapter)
+            body_from_cache = load_chapter_body_from_cache(chapter, cache_file)
+            if body_from_cache:
+                self._cache_chapter_body(chapter_id, body_from_cache)
+
+        try:
+            yield body_from_cache
+        finally:
+            updated_body = chapter.body
+            if updated_body and updated_body is not body_from_cache:
+                body_from_cache = updated_body
+
+            if body_from_cache:
+                self._cache_chapter_body(chapter_id, body_from_cache)
+            else:
+                self._cache_chapter_body(chapter_id, None)
+
+            chapter.body = None
+
+    def ensure_chapter_body(self, chapter: Chapter) -> Chapter:
+        if chapter.body:
+            return chapter
+
+        cached = self.load_cached_chapter(chapter)
+        if not cached:
+            return chapter
+
+        enriched = chapter.copy()
+        if cached.get("body") is not None:
+            enriched.body = cached.get("body")
+        if cached.get("images") is not None:
+            enriched.images = cached.get("images")
+        if "success" in cached:
+            enriched.success = cached.get("success", enriched.success)
+
+        for key, value in cached.items():
+            if key in {"body", "images", "success"}:
+                continue
+            enriched[key] = value
+
+        return enriched
 
     def start_download(self, signal=Event()):
         """Requires: crawler, chapters, output_path"""
@@ -252,6 +427,12 @@ class App:
         logger.info("Processing data for binding")
         assert self.crawler
 
+        for chapter in self.chapters:
+            if chapter.body:
+                chapter.body = None
+
+        # Binder helpers are responsible for fetching bodies when required via
+        # ``App.use_chapter_body`` to avoid loading every chapter simultaneously.
         data = {}
         if self.pack_by_volume:
             for vol in self.crawler.volumes:
@@ -261,14 +442,14 @@ class App:
                     vol["final_chapter"],
                 )
                 data[filename_suffix] = [
-                    x
-                    for x in self.chapters
-                    if x["volume"] == vol["id"] and len(x["body"]) > 0
+                    chapter
+                    for chapter in self.chapters
+                    if chapter["volume"] == vol["id"]
                 ]
         else:
             first_id = self.chapters[0]["id"]
             last_id = self.chapters[-1]["id"]
-            data[f"c{first_id}-{last_id}"] = self.chapters
+            data[f"c{first_id}-{last_id}"] = list(self.chapters)
 
         for fmt in generate_books(self, data):
             save_metadata(self)

@@ -26,6 +26,11 @@ class Chapter(Box):
         self.success = success
         self.update(kwargs)
 
+    def copy(self) -> "Chapter":
+        """Return a ``Chapter`` instance instead of a plain ``Box`` copy."""
+
+        return Chapter(**self.to_dict())
+
     @staticmethod
     def without_body(item: "Chapter") -> "Chapter":
         result = item.copy()

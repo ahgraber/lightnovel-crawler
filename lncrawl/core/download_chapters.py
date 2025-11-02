@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from threading import Event
-from typing import Dict
+from typing import Any, Optional
 
 from ..models.chapter import Chapter
 from .arguments import get_args
@@ -29,7 +29,7 @@ def get_chapter_file(
     return json_file
 
 
-def _save_chapter(file_name: Path, chapter: Chapter):
+def _save_chapter(file_name: Path, chapter: Chapter) -> Path:
     if not chapter.body:
         chapter.body = "<p><i>Failed to download chapter body</i></p>"
 
@@ -51,36 +51,106 @@ def _save_chapter(file_name: Path, chapter: Chapter):
     with file_name.open("w", encoding="utf-8") as fp:
         json.dump(chapter, fp, ensure_ascii=False)
 
+    chapter.body = None
+    return file_name
+
+
+def _chapter_ref_for_log(chapter: Chapter) -> str:
+    if chapter.title and chapter.id is not None:
+        return f"{chapter.title} (id={chapter.id})"
+    if chapter.title:
+        return chapter.title
+    if chapter.id is not None:
+        return f"id={chapter.id}"
+    return "unknown chapter"
+
+
+def load_chapter_body_from_cache(
+    chapter: Chapter, cache_file: Optional[Path]
+) -> Optional[str]:
+    chapter_ref = _chapter_ref_for_log(chapter)
+    if chapter.body:
+        return chapter.body
+
+    if not cache_file:
+        return None
+
+    try:
+        with cache_file.open("r", encoding="utf-8") as file:
+            cached_data: Any = json.load(file)
+    except FileNotFoundError:
+        logger.warning(
+            "Chapter cache missing for %s at %s", chapter_ref, cache_file
+        )
+        return None
+    except json.JSONDecodeError:
+        logger.warning(
+            "Invalid chapter cache for %s at %s", chapter_ref, cache_file
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "Failed to read chapter cache for %s at %s: %s",
+            chapter_ref,
+            cache_file,
+            exc,
+        )
+        return None
+
+    if not isinstance(cached_data, dict):
+        logger.warning(
+            "Chapter cache for %s at %s did not contain a JSON object",
+            chapter_ref,
+            cache_file,
+        )
+        return None
+
+    body = cached_data.get("body")
+    if body:
+        chapter.body = body
+
+    cached_images = cached_data.get("images")
+    if cached_images and not chapter.images:
+        chapter.images = cached_images
+
+    return body
+
 
 def restore_chapter_body(app):
     from .app import App
     assert isinstance(app, App) and app.crawler, 'Invalid app instance'
 
-    # attempt to restore from file cache
+    app.rebuild_chapter_cache_registry()
+
     restored = 0
-    file_names: Dict[int, Path] = {}
     for chapter in app.chapters:
-        file_name = get_chapter_file(
-            chapter,
-            pack_by_volume=app.pack_by_volume,
-            output_path=app.output_path,
-        )
-        file_names[chapter.id] = file_name
+        file_name = app.get_chapter_cache_file(chapter)
+        if not file_name:
+            continue
 
         if not file_name.is_file():
             continue
+
         try:
-            with open(file_name, "r", encoding="utf-8") as file:
-                old_chapter = json.load(file)
-                chapter.update(**old_chapter)
-                restored += 1
+            with file_name.open("r", encoding="utf-8") as file:
+                cached_chapter = json.load(file)
         except json.JSONDecodeError:
-            logger.debug("Unable to decode JSON from the file: %s" % file_name)
-        except Exception as e:
-            logger.exception("An error occurred while reading the file:", e)
+            logger.debug("Unable to decode JSON from the file: %s", file_name)
+            continue
+        except Exception:  # pragma: no cover - unexpected failure
+            logger.exception(
+                "An error occurred while reading the file: %s", file_name
+            )
+            continue
+
+        chapter.update(**cached_chapter)
+        app.register_chapter_cache_file(chapter, file_name)
+
+        if chapter.success:
+            restored += 1
+            chapter.body = None
 
     logger.info(f"Restored {restored}/{len(app.chapters)} chapters")
-    return file_names
 
 
 def fetch_chapter_body(app, signal=Event()):
@@ -91,7 +161,7 @@ def fetch_chapter_body(app, signal=Event()):
         return
 
     # attempt to restore from file cache
-    file_names = restore_chapter_body(app)
+    restore_chapter_body(app)
 
     # remaining chapters
     pending_chapters = [
@@ -104,9 +174,11 @@ def fetch_chapter_body(app, signal=Event()):
     app.fetch_chapter_progress = 100 * current / len(app.chapters)
     for chapter in app.crawler.download_chapters(pending_chapters, signal=signal):
         if chapter:
-            file_path = file_names.get(chapter.id)
-            if file_path:
-                _save_chapter(file_path, chapter)
+            file_path = app.get_chapter_cache_file(chapter)
+            if file_path is None:
+                file_path = app.register_chapter_cache_file(chapter)
+            saved_path = _save_chapter(file_path, chapter)
+            app.register_chapter_cache_file(chapter, saved_path)
         current += 1
         app.fetch_chapter_progress = 100 * current / len(app.chapters)
         yield
